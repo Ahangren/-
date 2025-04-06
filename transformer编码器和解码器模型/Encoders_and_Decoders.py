@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from labml_nn.utils import clone_module_list
 from feed_forward import FeedForward
-from mha import MultiHeadAttention
+from 多头注意力模型.Polycephalic_autoattention import MultiHeadAttention
 from PositionalEncoding import get_positional_encoding
 
 # 位置编码层
@@ -86,7 +86,7 @@ class Encoder(nn.Module):
     def __init__(self,layer,n_layers):
         super().__init__()
         # layer就是上面的TransformerLayer，这里的意思是复制多个将前一个的输出作为后一个的输入
-        self.layers=clone_model_list(layer,n_layers)
+        self.layers=clone_module_list(layer,n_layers)
         # 归一化层
         self.norm=nn.LayerNorm([layer.size])
 
