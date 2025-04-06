@@ -28,11 +28,7 @@ key 的维度标记为 j, b, h, d。
 点积求和：
 对 query 和 key 的最后一个维度 d 做点积（求和），得到未归一化的注意力分数。
 公式：
-output[i,j,b,h]=
-d
-∑
-
- query[i,b,h,d]⋅key[j,b,h,d]
+output[i,j,b,h]=d∑query[i,b,h,d]⋅key[j,b,h,d]
 输出形状：
 结果为 (i, j, b, h)，表示：
 对 batch 中每个样本（b），每个注意力头（h），query 的第 i 个位置与 key 的第 j 个位置的相似度分数。
