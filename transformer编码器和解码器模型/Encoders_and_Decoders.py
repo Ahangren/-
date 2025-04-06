@@ -82,3 +82,72 @@ class TransformerLayer:
 
         return x
 
+class Encoder(nn.Module):
+    def __init__(self,layer,n_layers):
+        super().__init__()
+        # layer就是上面的TransformerLayer，这里的意思是复制多个将前一个的输出作为后一个的输入
+        self.layers=clone_model_list(layer,n_layers)
+        # 归一化层
+        self.norm=nn.LayerNorm([layer.size])
+
+    def forward(self,x,mask):
+
+        for layer in self.layers:
+            x=layer(x,mask)
+        x=self.norm(x)
+        return x
+
+# 解码器模块
+class Decoder(nn.Module):
+    def __init__(self,layer,n_layers):
+        super().__init__()
+        self.layers=clone_module_list(layer,n_layers)
+        self.norm=nn.LayerNorm([layer.size])
+
+    def forward(self,x,memory,src_mask,tgt_mask):
+        for layer in self.layers:
+            x=layer(x=x,mask=tgt_mask,src=memory,src_mask=src_mask)
+
+        return self.norm(x)
+
+# 生成器模块
+class Generator(nn.Module):
+    def __init__(self,n_vocab,d_model):
+        super().__init__()
+        self.projection=nn.Linear(d_model,n_vocab)
+
+    def forward(self,x):
+        return self.projection(x)
+
+# 组合编码器和解码器模块
+class EncoderDecoder(nn.Module):
+    def __init__(self,encoder,decoder,src_embed,tgt_embed,generate):
+        super().__init__()
+        # 初始化编码器
+        self.encoder=encoder
+        # 初始化解码器
+        self.decoder=decoder
+        # 编码器的词嵌入
+        self.src_embed=src_embed
+        # 解码器的词嵌入
+        self.tgt_embed=tgt_embed
+        # 初始化生成器
+        self.generate=generate
+
+        for p in self.parameters():
+            if p.dim()>1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self,src,tgt,src_mask,tgt_mask):
+        enc=self.encode(src,src_mask)
+
+        return self.decode(enc,src_mask,tgt,tgt_mask)
+
+    def encode(self,src,src_mask):
+        return self.encoder(self.src_embed(src),src_mask)
+
+
+    def decode(self,memory,src_mask,tgt,tgt_mask):
+        return self.decoder(self.tgt_embed(tgt),memory,src_mask,tgt_mask)
+
+
