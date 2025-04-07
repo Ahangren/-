@@ -62,13 +62,6 @@ class RelativeMultiHeadAttention(MultiHeadAttention):
         return ac+bd
 
 
-# def inspect(tensor, name=None):
-#     """打印张量的形状和内容"""
-#     if name:
-#         print(f"{name}:")
-#     print("shape:", tensor.shape)
-#     print("values:\n", tensor)
-#     print()
 
 def _test_shift_right():
    x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
