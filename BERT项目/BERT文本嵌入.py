@@ -23,7 +23,7 @@ class BERTChunkEmbeddings:
     def _trim_chunk(chunk):
         striped=chunk.strip()
         parts=striped.split()
-        striped=striped[len(parts[0]):len(parts[-1])]
+        striped=striped[len(parts[0]):-len(parts[-1])]
         striped=striped.strip()
 
         if not striped:
@@ -35,7 +35,7 @@ class BERTChunkEmbeddings:
             # 处理每个句子的空格和第一个词和最后一个词
             trimmed_chunks=[self._trim_chunk(c) for c in chunks]
             # 将句子转换成模型能懂的序列，用tokenizer将句子变成数字ID，bert模型中游个字典，每个词都有一个对应的id
-            tokens=self.tokenizer(trimmed_chunks,return_tensors='pt',add_special_tokens=False)
+            tokens=self.tokenizer(trimmed_chunks,return_tensors='pt',add_special_tokens=False,padding=True,truncation=True)
             input_ids = tokens['input_ids'].to(self.device)
             # 同时生成两个辅助标记。attention_mask和token_type_ids
             #attention_mask: 在bert分词中会有填充符和空白符，这个就是用来记录的，是词的地方为1是空白的位置为0，训练的时候关注1的位置就可以了
@@ -76,3 +76,24 @@ class BERTChunkEmbeddings:
             # 过程：文本输入 -> 清理 -> 转token ID -> BERT处理 -> 字向量 -> 加权平均 -> 句子向量
             return emb
 
+
+def _test():
+    from labml.logger import inspect
+    device=torch.device('cpu')
+    bert=BERTChunkEmbeddings(device)
+    text=['男儿不展凌云志向','空负天生八尺躯']
+    encoded_input=bert.tokenizer(text,return_tensors='pt',add_special_tokens=False,padding=True)
+    inspect(encoded_input,_expand=True)
+    output=bert.model(input_ids=encoded_input['input_ids'].to(device),
+                      attention_mask=encoded_input['attention_mask'].to(device),
+                      token_type_ids=encoded_input['token_type_ids'].to(device))
+    inspect({'last_hidden_state':output['last_hidden_state'],
+            'pooler_output':output['pooler_output']},_expand=True)
+
+    inspect(bert.tokenizer.convert_ids_to_tokens(encoded_input['input_ids'][0]),_n=-1)
+    inspect(bert.tokenizer.convert_ids_to_tokens(encoded_input['input_ids'][1]),_n=-1)
+
+    inspect(bert(text))
+
+if __name__ == '__main__':
+    _test()
