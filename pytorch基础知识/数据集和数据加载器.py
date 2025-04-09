@@ -4,6 +4,7 @@
 
 import torch
 import torch.nn as nn
+from holoviews.operation import transform
 from torch.utils.data import DataLoader,Dataset
 from torchvision import datasets
 from torchvision.transforms import ToTensor
@@ -55,38 +56,41 @@ import pandas as pd
 from torchvision.io import read_image
 
 class CustomImageDataset(Dataset):
-    def __init__(self,annotations_file,img_dir,transform=None,target_transform=None):
-        self.img_label=pd.read_csv(annotations_file)
-        self.img_dir=img_dir
-        self.transform=transform
-        self.target_transform=target_transform
-        self.mast=1
+    def __init__(self,label_path,data_path,transformer=None,label_transformer=None):
+       self.img_label=pd.read_csv(label_path)
+       self.data_path=data_path
+       self.transformer=transformer
+       self.label_transformer=label_transformer
 
     def __len__(self):
         return len(self.img_label)
 
-    def __getitem__(self, idx):
-        img_path=os.path.join(self.img_dir,self.img_label.iloc[idx,0])
-        image=read_image(img_path)
-        label=self.img_label.iloc[idx,1]
-        if self.transform:
-            image=self.transform(image)
-        if self.target_transform:
-            label=self.target_transform(label)
+    def __getitem__(self, item):
+        image_path=os.path.join(self.data_path,self.img_label.iloc[item,0])
+        image_data=read_image(image_path)
+        label=self.img_label.iloc[item,1]
+        if self.transformer:
+            image_data=self.transformer(image_data)
+        if self.label_transformer:
+            label_data=self.label_transformer(label)
 
-        return image,label
+        return image_data,label_data
 
-train_dataloader=DataLoader(training_data,batch_size=64,shuffle=True)
-test_dataloader=DataLoader(test_data,batch_size=64,shuffle=True)
+# 使用dataloader加载数据，batch_size=64，并且打乱数据
+train_data=DataLoader(training_data,batch_size=64,shuffle=True)
+test_data=DataLoader(test_data,batch_size=64,shuffle=True)
 
-# 遍历dataloader
-train_features,train_labels=next(iter(train_dataloader))
+train_features,train_labels=next(iter(train_data))
 print(f'feature batch shape: {train_features.size()}')
-print(f'labels batch shape: {train_labels.size()}')
+print(f'label batch shape: {train_labels.size()}')
 
 img=train_features[0].squeeze()
 label=train_labels[0]
 plt.imshow(img,cmap='gray')
 plt.show()
-print(f'label: {label}')
+print(f'label:{label}')
+
+
+
+
 
