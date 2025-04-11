@@ -65,72 +65,73 @@ net=Net()
 import torch.optim as optim
 criterion=nn.CrossEntropyLoss()
 optim=optim.SGD(Net.parameters(),lr=1e-2,momentum=0.9)
+if __name__ == '__main__':
 
-for epoch in range(2):
-    running_loss=0.0
-    for i,data in enumerate(trainloader,0):
-        inputs,labels=data
-        optim.zero_grad()
-        output=net(inputs)
-        loss=criterion(output,labels)
-        loss.backward()
-        optim.step()
+    for epoch in range(2):
+        running_loss=0.0
+        for i,data in enumerate(trainloader,0):
+            inputs,labels=data
+            optim.zero_grad()
+            output=net(inputs)
+            loss=criterion(output,labels)
+            loss.backward()
+            optim.step()
 
-        running_loss+=loss.item()
-        if i%2000==1999:
-           print(f'{epoch+1},{i+1:5d} loss:{running_loss/2000:.3f}')
-           running_loss=0.0
-print('Finished Training')
-
-
-# 保存模型
-PATH='./cifar_net.path'
-torch.save(net.state_dict(),PATH)
+            running_loss+=loss.item()
+            if i%2000==1999:
+               print(f'{epoch+1},{i+1:5d} loss:{running_loss/2000:.3f}')
+               running_loss=0.0
+    print('Finished Training')
 
 
-# 测试一下我们训练的模型
-dataiter=iter(testloader)
-images,label=next(dataiter)
-imshow(torchvision.utils.make_grid(images))
-print(f'GtoudTruth :',' '.join(f'{classes[label[j]]}' for j in range(4)))
-
-net=Net()
-
-net.load_state_dict(torch.load(PATH,weights_only=True))
-
-outputs=net(images)
-
-_,predicted=torch.max(outputs,1)
-print('Predicted:', ' '.join(f'{classes[predicted[j]]:5s}' for j in range(4)))
-
-correct=0
-total=0
-with torch.no_grad():
-    for data in testloader:
-        image,label=data
-        output=net(image)
-        _,predict=torch.max(output,1)
-        total+=label.size(0)
-        correct+=(predict==label).sum().item()
-print(f"这给模型在一万个测试数据中的准确率为：{100*correct//total:.2f}%")
+    # 保存模型
+    PATH='./cifar_net.path'
+    torch.save(net.state_dict(),PATH)
 
 
-# 看看有哪些类表现的比较好，有那些类表现的不好
-correct_pred={classname :0 for classname in classes}
-total_pred={classname:0 for classname in classes}
+    # 测试一下我们训练的模型
+    dataiter=iter(testloader)
+    images,label=next(dataiter)
+    imshow(torchvision.utils.make_grid(images))
+    print(f'GtoudTruth :',' '.join(f'{classes[label[j]]}' for j in range(4)))
 
-with torch.no_grad():
-    for data in testloader:
-        images,labels=data
-        output=net(images)
-        _,predict=torch.max(output,1)
-        for label in labels:
-            if predict==label:
-                correct_pred[classes[label]]+=1
-            total_pred[classes[label]]+=1
-for classname,correct_count in correct_pred.items():
-    accuracy=100*float(correct_count)/total_pred[classname]
-    print(f"{classname}的准确率为{accuracy:.1f}")
+    net=Net()
+
+    net.load_state_dict(torch.load(PATH,weights_only=True))
+
+    outputs=net(images)
+
+    _,predicted=torch.max(outputs,1)
+    print('Predicted:', ' '.join(f'{classes[predicted[j]]:5s}' for j in range(4)))
+
+    correct=0
+    total=0
+    with torch.no_grad():
+        for data in testloader:
+            image,label=data
+            output=net(image)
+            _,predict=torch.max(output,1)
+            total+=label.size(0)
+            correct+=(predict==label).sum().item()
+    print(f"这给模型在一万个测试数据中的准确率为：{100*correct//total:.2f}%")
+
+
+    # 看看有哪些类表现的比较好，有那些类表现的不好
+    correct_pred={classname :0 for classname in classes}
+    total_pred={classname:0 for classname in classes}
+
+    with torch.no_grad():
+        for data in testloader:
+            images,labels=data
+            output=net(images)
+            _,predict=torch.max(output,1)
+            for label in labels:
+                if predict==label:
+                    correct_pred[classes[label]]+=1
+                total_pred[classes[label]]+=1
+    for classname,correct_count in correct_pred.items():
+        accuracy=100*float(correct_count)/total_pred[classname]
+        print(f"{classname}的准确率为{accuracy:.1f}")
 
 
 
