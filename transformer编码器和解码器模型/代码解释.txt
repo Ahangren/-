@@ -1,0 +1,2 @@
+一、位置编码模块：PositionEncoding类
+该类实现了
