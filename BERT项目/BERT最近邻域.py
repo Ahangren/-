@@ -1,119 +1,160 @@
-from typing import List,Optional
+from typing import List, Optional
 import faiss
 import numpy as np
 import torch
-
-from labml import lab,monit
+from labml import lab, monit
 from labml_helpers.datasets.text import TextFileDataset
 from labml_nn.transformers.retro.bert_embeddings import BERTChunkEmbeddings
-from networkx import neighbors
 
 
-# 建立一个支持快速检索的文本数据库，将文本分块后用BERT编码，并用FAISS建立高效索引
 def build_dataset(
-    chunk_len: int=16,  # 每个文本快的长度
-    batch_size : int=64,  # 编码批次大小
-    d_emb :int=768, # BERT嵌入维度
-    n_centeroids :int=256, # FAISS聚类中心数（影响检索精度）
-    code_size :int =84,  # FAISS压缩编码大小（空间与精度权衡）
-    n_probe :int=8,  # FAISS搜索时探查的聚类中心数
-    n_train :int=50000,  # FAISS索引的样本数
+        chunk_len: int = 16,  # 每个文本块的长度（字符数）
+        batch_size: int = 64,  # BERT编码的批处理大小
+        d_emb: int = 768,  # BERT嵌入维度
+        n_centroids: int = 256,  # FAISS聚类中心数
+        code_size: int = 64,  # FAISS压缩编码大小（建议设为64，原84可能有误）
+        n_probe: int = 8,  # FAISS搜索时探查的聚类中心数
+        n_train: int = 50000,  # 训练FAISS索引的样本数
+        force_rebuild: bool = False  # 是否强制重新构建索引
 ):
-    # 加载本地数据
-    dataset=TextFileDataset(
-        lab.get_data_path()/'tiny_shakespeare.txt',
+    """构建文本检索数据库"""
+    index_path = lab.get_data_path() / 'retro.index'
+
+    # 如果索引已存在且不需要重建，则直接返回
+    if index_path.exists() and not force_rebuild:
+        print(f"Index already exists at {index_path}")
+        return
+
+    # 加载文本数据
+    dataset = TextFileDataset(
+        lab.get_data_path() / 'tiny_shakespeare.txt',
         list,
-        url='https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'  # 数据下载地址
+        url='https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
     )
-    text=dataset.train
-    # 文本分块处理
-    chunks=[
-        text[i:i+chunk_len] for i in range(0,len(text),chunk_len) if i+chunk_len*2<len(text)
+    text = dataset.train
+
+    # 文本分块处理（确保最后一块足够长）
+    chunks = [
+        text[i:i + chunk_len]
+        for i in range(0, len(text) - chunk_len * 2, chunk_len)  # 确保i+chunk_len*2不越界
     ]
+    chunk_offsets = np.array([i for i in range(0, len(text) - chunk_len * 2, chunk_len)])
 
-    chunk_offsets=np.array([i for i in range(0,len(text),chunk_len) if i+chunk_len*2<len(text)])
+    # BERT分块编码
+    bert = BERTChunkEmbeddings(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    chunk_emb = []
 
-    n_chunks=len(chunks)
-    bert=BERTChunkEmbeddings(torch.device('cpu')) # 初始化BERT嵌入器cpu模式
-    chunk_emb=[]
+    with torch.no_grad():  # 禁用梯度计算
+        for i in monit.iterate('Get embeddings', range(0, len(chunks), batch_size)):
+            batch = chunks[i:i + batch_size]
+            embeddings = bert(batch).cpu()  # 转移到CPU避免GPU内存不足
+            chunk_emb.append(embeddings)
 
-    for i in monit.iterate('Get embeddings',range(0,n_chunks,batch_size)):
-        chunk_emb.append(bert(chunks[i:i+batch_size]).cpu())
-    chunk_emb=torch.cat(chunk_emb,dim=0)
+    chunk_emb = torch.cat(chunk_emb, dim=0).numpy()  # 转换为NumPy数组供FAISS使用
 
-    quantizer=faiss.IndexFlatL2(d_emb)
-    index=faiss.IndexIVFPQ(quantizer,d_emb,n_centeroids,code_size,8)
-    index.nprobe=n_probe
+    # 构建FAISS索引
+    quantizer = faiss.IndexFlatL2(d_emb)
+    index = faiss.IndexIVFPQ(quantizer, d_emb, n_centroids, code_size, 8)
+    index.nprobe = n_probe
 
-    random_sample=np.random.choice(
-        np.arange(n_chunks),size=[min(n_train,n_chunks)],replace=True
-    )
+    # 训练索引
+    if len(chunk_emb) < n_train:
+        n_train = len(chunk_emb)
 
     with monit.section('Train index'):
-        index.train(chunk_emb[random_sample])
+        train_sample = np.random.choice(len(chunk_emb), size=n_train, replace=False)
+        index.train(chunk_emb[train_sample])
 
-    for s in monit.iterate('Index',range(0,n_chunks,1024)):
-        e=min(s+1024,n_chunks)
-        index.add_with_ids(chunk_emb[s:e],chunk_offsets[s:e])
+    # 添加数据到索引
+    with monit.section('Add to index'):
+        index.add_with_ids(chunk_emb, chunk_offsets)
 
+    # 保存索引
     with monit.section('Save'):
-        faiss.write_index(index,str(lab.get_data_path()/'retro.index'))
+        faiss.write_index(index, str(index_path))
+    print(f"Index saved to {index_path}")
+
 
 class RetroIndex:
     def __init__(
-        self,
-        chunk_len: int = 16,               # 每个文本块的长度（字符数）
-        n_probe: int = 8,                  # FAISS 搜索时探查的聚类中心数
-        n_neighbors: int = 2,              # 最终返回的最近邻数量
-        n_extra: int = 2,                  # 初步搜索时多取的邻居数（用于后续过滤）
-        exclude_neighbor_span: int = 8      # 排除邻近块的阈值（避免重叠）
+            self,
+            chunk_len: int = 16,
+            n_probe: int = 8,
+            n_neighbors: int = 2,
+            n_extra: int = 2,
+            exclude_neighbor_span: int = 8,
+            device: str = 'cpu'
     ):
-        # 初始化参数
+        """
+        初始化检索器
+
+        参数:
+            device: 指定设备 ('cpu' 或 'cuda')
+        """
         self.n_neighbors = n_neighbors
         self.chunk_len = chunk_len
         self.exclude_neighbor_span = exclude_neighbor_span
         self.n_extra = n_extra
 
-        # 加载 BERT 分块嵌入器（CPU模式）
-        self.bert = BERTChunkEmbeddings(torch.device('cpu'))
+        # 根据设备初始化BERT
+        self.device = torch.device(device)
+        self.bert = BERTChunkEmbeddings(self.device)
 
-        # 加载预训练的 FAISS 索引
+        # 加载FAISS索引
+        index_path = lab.get_data_path() / 'retro.index'
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index file not found at {index_path}. Run build_dataset() first.")
+
         with monit.section('Load index'):
-            self.index = faiss.read_index(str(lab.get_data_path() / 'retro.index'))
-            self.index.nprobe = n_probe  # 设置搜索时的聚类中心探查数
+            self.index = faiss.read_index(str(index_path))
+            self.index.nprobe = n_probe
 
-    def filter_neighbors(self, offset: int, neighbor_offsets: List[int]):
-        # 过滤掉与当前块位置太近的邻居块
-        return [
-            n for n in neighbor_offsets
-            if n < offset - (self.chunk_len + self.exclude_neighbor_span)  # 邻居在查询块左侧远处
-               or n > offset + (self.chunk_len + self.exclude_neighbor_span)  # 邻居在查询块右侧远处
-        ]
+    def filter_neighbors(self, offset: int, neighbor_offsets: List[int]) -> List[int]:
+        """过滤掉位置太近的邻居块"""
+        min_offset = offset - (self.chunk_len + self.exclude_neighbor_span)
+        max_offset = offset + (self.chunk_len + self.exclude_neighbor_span)
+        return [n for n in neighbor_offsets if n < min_offset or n > max_offset]
 
-    def __call__(self, query_chunks: List[str], offsets: Optional[List[int]]):
-        # 将查询文本块通过 BERT 编码为向量
-        emb = self.bert(query_chunks).cpu()
+    def __call__(
+            self,
+            query_chunks: List[str],
+            offsets: Optional[List[int]] = None
+    ) -> List[List[int]]:
+        """
+        检索相似文本块
 
-        # 在 FAISS 索引中搜索最近的邻居
-        # 返回：距离（未使用）和邻居块的位置列表
-        distance, neighbors_offsets = self.index.search(
-            emb.numpy(),  # 查询向量
-            self.n_neighbors + self.n_extra  # 搜索数量 = 最终数量 + 冗余量
+        返回:
+            每个查询块对应的邻居位置列表
+        """
+        # BERT编码
+        with torch.no_grad():
+            emb = self.bert(query_chunks).cpu().numpy()
+
+        # FAISS搜索
+        _, neighbors_offsets = self.index.search(
+            emb,
+            self.n_neighbors + self.n_extra
         )
 
-        # 如果提供了 offsets（查询块的位置信息），过滤掉邻近的邻居
+        # 过滤邻近块
         if offsets is not None:
             neighbors_offsets = [
-                self.filter_neighbors(off, n_off)
+                self.filter_neighbors(off, n_off.tolist())  # 转换为list
                 for off, n_off in zip(offsets, neighbors_offsets)
             ]
 
-        # 截取前 n_neighbors 个有效邻居
-        neighbors_offsets = [
-            n_off[:self.n_neighbors] for n_off in neighbors_offsets
-        ]
+        # 确保返回指定数量的邻居
+        return [n_off[:self.n_neighbors] for n_off in neighbors_offsets]
 
-        return neighbors_offsets  # 返回最终的邻居位置列表
 
 if __name__ == '__main__':
-    build_dataset()
+    # 示例用法
+    build_dataset(force_rebuild=True)  # 首次运行需要构建索引
+
+    # 初始化检索器
+    retriever = RetroIndex(device='cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 测试查询
+    test_queries = ["To be or not", "That is the question"]
+    results = retriever(test_queries, offsets=[1000, 2000])  # 假设的偏移量
+    print("Retrieved neighbor positions:", results)

@@ -1,353 +1,543 @@
 import math
-from typing import Set
+from typing import Set, Optional, Tuple
 import torch
-import torch.nn as nn
-from anyio import sleep_until
-from labml.logger import inspect
-from torch.nn import functional as F
+from torch import nn
 
 
 class RotaryPositionalEmbeddings(nn.Module):
-    """旋转式位置编码 (RoPE)"""
+    """优化的旋转位置编码(RoPE)实现"""
 
     def __init__(self, d: int, base: int = 10000):
-        """
-        参数:
-            d:     嵌入维度（必须为偶数）
-            base:  频率计算的基数（控制波长范围）
-        """
         super().__init__()
-        assert d % 2 == 0, "嵌入维度d必须是偶数"
-
-        # 初始化θ值：θ_i = 1/(base^(2i/d)), i ∈ [0, d//2-1]
-        # 原论文中θ不可训练，这里使用register_buffer而非Parameter
-        theta = 1. / (base ** (torch.arange(0, d // 2).float() / (d // 2)))
-        self.register_buffer('theta', theta)  # 固定参数，不参与训练
+        # 正确初始化theta参数: θ_i = 10000^(-2i/d)
+        theta = 1.0 / (base ** (torch.arange(0, d, 2).float() / d))
+        self.register_buffer("theta", theta, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        应用旋转位置编码到输入张量
-
-        输入:
-            x:  形状为 [batch_size, seq_len, n_heads, d] 的张量
-                (例如Transformer中多头注意力的Q/K/V)
-
-        返回:
-            应用旋转编码后的张量（保持原始形状）
-        """
         batch_size, seq_len, n_heads, d = x.shape
-        half_dim = d // 2  # 旋转编码操作需要将维度分成两半
+        d_2 = d // 2
 
-        # 生成位置序列 [0, 1, ..., seq_len-1]
-        positions = torch.arange(seq_len, device=x.device).type_as(self.theta)
+        # 生成位置索引[0, 1, ..., seq_len-1]
+        pos_idx = torch.arange(seq_len, device=x.device, dtype=torch.float32)
 
-        # 计算所有位置和维度的旋转角度 mθ_i
-        # 结果形状: [seq_len, d//2]
-        freqs = torch.einsum('n,d->nd', positions, self.theta)
+        # 计算旋转角度: pos_idx * theta
+        freqs = torch.einsum('i,j->ij', pos_idx, self.theta)
 
-        # 计算旋转矩阵的cos和sin分量
-        cos = torch.cos(freqs)[None, :, None, :]  # 广播维度 [1, seq_len, 1, d//2]
-        sin = torch.sin(freqs)[None, :, None, :]  # 同上
+        # 拼接相同的旋转角度以匹配x的维度
+        freqs = torch.cat([freqs, freqs], dim=-1)  # [seq_len, d]
 
-        # 将输入x分成前半部分和后半部分
-        x1, x2 = x[..., :half_dim], x[..., half_dim:]
+        # 一次性计算所有cos和sin值
+        cos_val = torch.cos(freqs)[None, :, None, :]  # [1, seq_len, 1, d]
+        sin_val = torch.sin(freqs)[None, :, None, :]  # [1, seq_len, 1, d]
 
-        # 执行旋转操作（核心公式）
-        # x'_i =  x_i * cos(mθ_i) - x_{i+d/2} * sin(mθ_i)
-        # x'_{i+d/2} = x_i * sin(mθ_i) + x_{i+d/2} * cos(mθ_i)
-        rotated_x1 = x1 * cos - x2 * sin
-        rotated_x2 = x1 * sin + x2 * cos
-
-        # 拼接旋转后的两部分
-        return torch.cat([rotated_x1, rotated_x2], dim=-1)
-
-
-# 自我注意力层（适用于因果和非因果的多头注意力）
-class SelfAttention(nn.Module):
-    def __init__(self,d_model:int,n_heads:int,d_k:int,is_causal:bool):
-
-        super().__init__()
-
-        self.is_causal=is_causal
-        self.n_heads=n_heads
-        self.d_model=d_model
-        self.d_k=d_k
-        self.scale=1/math.sqrt(d_k)
-
-        self.query=nn.Linear(d_model,n_heads*d_k)
-        self.key=nn.Linear(d_model,n_heads*d_k)
-        self.value=nn.Linear(d_model,n_heads*d_k)
-
-        self.rotaty_pe=RotaryPositionalEmbeddings(d_k)
-        # self.softmax=nn.Softmax()
-        self.norm=nn.LayerNorm(d_model)
-        self.output=nn.Linear(n_heads*d_k,d_model)
-
-    def mask_attention(self,attn:torch.Tensor):
-        if not self.is_causal:
-            return attn
-        seq_len=attn.size(-1)
-        mask=torch.tril(torch.ones(seq_len,seq_len,device=attn.device,dtype=torch.bool))
-        return attn.masked_fill(~mask,float('-inf'))
-
-    def forward(self,h:torch.Tensor):
-        h_ser=h
-
-        h=self.norm(h)
-        batch_size, seq_len, _ = h.shape
-
-        q=self.query(h).view(batch_size,seq_len,self.n_heads,self.d_k)
-        k=self.key(h).view(batch_size,seq_len,self.n_heads,self.d_k)
-        v=self.value(h).view(batch_size,seq_len,self.n_heads,self.d_k)
+        # 旋转操作: [-x_{d/2+1}, ..., -x_d, x_1, ..., x_{d/2}]
+        x_rot = torch.cat([-x[..., d_2:], x[..., :d_2]], dim=-1)
 
         # 应用旋转位置编码
-        q=self.rotaty_pe(q)
-        k=self.rotaty_pe(k)
+        return x * cos_val + x_rot * sin_val
 
-        # 计算注意力
-        attn=torch.einsum('bihd,bjhd->bhij',q,k)*self.scale
 
-        # 应用因果掩码
-        attn=self.mask_attention(attn)
+class SelfAttention(nn.Module):
+    """优化的自注意力层实现"""
+
+    def __init__(self, d_model: int, n_heads: int, d_k: int, is_causal: bool, eps: float = 1e-5):
+        super().__init__()
+        self.is_causal = is_causal
+        self.n_heads = n_heads
+        self.d_k = d_k
+        self.scale = 1 / math.sqrt(d_k)
+
+        # 线性投影层
+        self.q_proj = nn.Linear(d_model, n_heads * d_k)
+        self.k_proj = nn.Linear(d_model, n_heads * d_k)
+        self.v_proj = nn.Linear(d_model, n_heads * d_k)
+
+        # 输出层
+        self.out_proj = nn.Linear(n_heads * d_k, d_model)
+
+        # 归一化层
+        self.norm = nn.LayerNorm(d_model, eps=eps)
+
+        # 旋转位置编码
+        self.rotary_pe = RotaryPositionalEmbeddings(d_k)
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        # 使用Xavier初始化查询、键、值投影层
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+        # 偏置初始化为0
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    def _create_causal_mask(self, attn: torch.Tensor) -> torch.Tensor:
+        """创建因果注意力掩码"""
+        if not self.is_causal:
+            return attn
+
+        # 生成上三角布尔掩码(对角线以上为True)
+        mask = torch.ones_like(attn, dtype=torch.bool).triu(diagonal=1)
+        return attn.masked_fill(mask, float('-inf'))
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # 残差连接
+        residual = h
+        h = self.norm(h)
+
+        batch_size, seq_len, _ = h.shape
+
+        # 投影查询、键、值并分割头
+        q = self.q_proj(h).view(batch_size, seq_len, self.n_heads, self.d_k)
+        k = self.k_proj(h).view(batch_size, seq_len, self.n_heads, self.d_k)
+        v = self.v_proj(h).view(batch_size, seq_len, self.n_heads, self.d_k)
+
+        # 应用旋转位置编码
+        q = self.rotary_pe(q)
+        k = self.rotary_pe(k)
+
+        # 计算注意力分数
+        attn = torch.einsum('bihd,bjhd->bhij', q, k) * self.scale
+
+        # 应用因果掩码(如果需要)
+        attn = self._create_causal_mask(attn)
 
         # 计算注意力权重
-        attn=F.softmax(attn,dim=-1)
+        attn = torch.softmax(attn, dim=-1)
+
+        # 应用注意力到值上
+        h = torch.einsum("bhij,bjhd->bihd", attn, v)
+
+        # 合并多头并投影输出
+        h = h.reshape(batch_size, seq_len, -1)
+        h = self.out_proj(h)
+
+        return h + residual
 
 
-        # 计算得分
-        attn=torch.einsum('bhij,bjhd->bihd',attn,v)
-
-        # 合并多头
-        out=attn.reshape(batch_size,seq_len,-1)
-
-        # 输出投影+残差连接
-        return out+h_ser
-
-# 交叉注意力机制
 class CrossAttention(nn.Module):
-    def __init__(self,d_model,n_heads,d_k):
+    """优化的交叉注意力层实现"""
+
+    def __init__(self, d_model: int, n_heads: int, d_k: int, eps: float = 1e-5):
         super().__init__()
-        self.d_model=d_model
-        self.n_heads=n_heads
-        self.d_k=d_k
-        self.scale=1/math.sqrt(d_k)
+        self.n_heads = n_heads
+        self.d_k = d_k
+        self.scale = 1 / math.sqrt(d_k)
 
-        self.softmax=nn.Softmax(dim=1)
-        self.query=nn.Linear(d_model,self.n_heads*self.d_k)
-        self.key=nn.Linear(d_model,n_heads*d_k)
-        self.value=nn.Linear(d_model,n_heads*d_k)
+        # 线性投影层
+        self.q_proj = nn.Linear(d_model, n_heads * d_k)
+        self.k_proj = nn.Linear(d_model, n_heads * d_k)
+        self.v_proj = nn.Linear(d_model, n_heads * d_k)
 
-        self.output=nn.Linear(n_heads*d_k,d_model)
-        self.norm=nn.LayerNorm(d_model)
+        # 输出层
+        self.out_proj = nn.Linear(n_heads * d_k, d_model)
 
-    def forward(self,e,h):
-        e_res=e
+        # 归一化层
+        self.norm = nn.LayerNorm(d_model, eps=eps)
 
-        e=self.norm(e)
-        batch_size=e.shape[0]
-        q=self.query(e).view(batch_size,-1,self.n_heads,self.d_k)
-        k=self.key(h).view(batch_size,-1,self.n_heads,self.d_k)
-        v=self.value(h).view(batch_size,-1,self.n_heads,self.d_k)
+        # 初始化权重
+        self._init_weights()
 
-        attn=torch.einsum('bqhd,bkhd->bhqk',q,k)*self.scale
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
 
-        attn=self.softmax(attn)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
-        out=torch.einsum('bhqk,bqhd->bqhd',attn,v)
-        output=out.reshape(batch_size,-1,self.n_heads*self.d_k)
+    def forward(self, e: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        # 残差连接
+        residual = e
+        e = self.norm(e)
+
+        batch_size, chunks, neighbors, neighbor_len, _ = e.shape
+        _, chunk_num, chunk_len, _ = h.shape
+
+        # 投影查询(来自编码器输出)
+        q = self.q_proj(e).view(batch_size, chunks, neighbors, neighbor_len, self.n_heads, self.d_k)
+
+        # 投影键和值(来自输入块)
+        k = self.k_proj(h).view(batch_size, chunk_num, chunk_len, self.n_heads, self.d_k)
+        v = self.v_proj(h).view(batch_size, chunk_num, chunk_len, self.n_heads, self.d_k)
+
+        # 计算注意力分数
+        attn = torch.einsum('bcnihd,bcjhd->bcnhij', q, k) * self.scale
+
+        # 计算注意力权重
+        attn = torch.softmax(attn, dim=-1)
+
+        # 应用注意力到值上
+        e = torch.einsum("bcnhij,bcjhd->bcnihd", attn, v)
+
+        # 合并多头并投影输出
+        e = e.reshape(batch_size, chunks, neighbors, neighbor_len, -1)
+        e = self.out_proj(e)
+
+        return e + residual
 
 
-        return self.output(output+e_res)
-
-# 分块交叉注意力机制
 class ChunkedCrossAttention(nn.Module):
-    def __init__(self,d_model,n_heads,d_k,chunk_len):
+    """优化的分块交叉注意力实现"""
+
+    def __init__(self, d_model: int, n_heads: int, d_k: int, chunk_len: int, eps: float = 1e-5):
         super().__init__()
-        self.d_model=d_model
-        self.n_heads=n_heads
-        self.d_k=d_k
-        self.scale=1/math.sqrt(d_k)
-        self.chunk_len=chunk_len
+        self.chunk_len = chunk_len
+        self.n_heads = n_heads
+        self.d_k = d_k
+        self.scale = 1 / math.sqrt(d_k)
 
-        self.query=nn.Linear(d_model,n_heads*d_k)
-        self.key=nn.Linear(d_model,n_heads*d_k)
-        self.value=nn.Linear(d_model,n_heads*d_k)
+        # 线性投影层
+        self.q_proj = nn.Linear(d_model, n_heads * d_k)
+        self.k_proj = nn.Linear(d_model, n_heads * d_k)
+        self.v_proj = nn.Linear(d_model, n_heads * d_k)
 
-        self.norm=nn.LayerNorm(d_model)
-        self.output=nn.Linear(n_heads*d_k,d_model)
+        # 输出层
+        self.out_proj = nn.Linear(n_heads * d_k, d_model)
 
-    def forward(self,h,e):
-        batch_size=h.size(0)
-        chunks=e.size(1)
-        if not chunks:
-            return h
+        # 归一化层
+        self.norm = nn.LayerNorm(d_model, eps=eps)
 
-        h_res=h
-        h=h[:,self.chunk_len-1]
-        h=self.norm(h)
+        # 初始化权重
+        self._init_weights()
 
-        if h.size(1)<chunks*self.chunk_len:
-            pad_len=chunks*self.chunk_len-h.size(1)
-            h=F.pad(0,0,0,pad_len)
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
 
-        h=h.view(batch_size,chunks,self.chunk_len,-1)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
-        q=self.query(h).view(*h.shape[:-1],self.n_heads,self.d_k)
-        k=self.key(e).view(*e.shape[:-1],self.n_heads,self.d_k)
-        v=self.value(e).view(*e.shape[:-1],self.n_heads,self.d_k)
+    def forward(self, h: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        # 残差连接
+        residual = h
 
-        attn=torch.einsum('bclhd,bcnmhd->bchlnm',q,k)*self.scale
+        # 处理空块情况
+        if e.shape[1] == 0:  # 如果没有块
+            return residual
 
-        attn=F.softmax(attn.view(*attn.shape[:-2],-1),dim=-1)
-        attn=attn.view(attn.shape[0],-1,*attn.shape[2:])
+        batch_size = h.size(0)
+        chunks = e.size(1)
+        neighbors = e.size(2)
+        neighbor_len = e.size(3)
+        d_model = h.size(-1)
 
-        out=torch.einsum('bchlnm,bcnmhd->bclhd',attn,v)
+        # 移位序列以对齐块
+        h_shifted = h[:, self.chunk_len - 1:]
+        h_shifted = self.norm(h_shifted)
 
-        out=out.reshape(batch_size,chunks*self,self.chunk_len,-1)
+        # 计算需要的填充长度
+        total_len = chunks * self.chunk_len
+        current_len = h_shifted.size(1)
+        pad_len = max(0, total_len - current_len)
 
-        out=out.reshape(batch_size,chunks*self.chunk_len,-1)
-        out=self.output(out)
+        # 应用填充(如果需要)
+        if pad_len > 0:
+            h_padded = torch.cat([
+                h_shifted,
+                torch.zeros(batch_size, pad_len, d_model, device=h.device)
+            ], dim=1)
+        else:
+            h_padded = h_shifted[:, :total_len]
 
-        out=F.pad(out,(0,0,self.chunk_len-1,0),value=0)
-        return out[:,:h_res.size(1)]+h_res
+        # 重塑为块形式
+        h_blocks = h_padded.view(batch_size, chunks, self.chunk_len, d_model)
 
-# 前馈网络层
+        # 投影查询(来自输入)
+        q = self.q_proj(h_blocks).view(batch_size, chunks, self.chunk_len, self.n_heads, self.d_k)
+
+        # 投影键和值(来自编码的邻居)
+        k = self.k_proj(e).view(batch_size, chunks, neighbors, neighbor_len, self.n_heads, self.d_k)
+        v = self.v_proj(e).view(batch_size, chunks, neighbors, neighbor_len, self.n_heads, self.d_k)
+
+        # 计算注意力分数
+        attn = torch.einsum('bcihd,bcnjhd->bchinj', q, k) * self.scale
+
+        # 计算注意力权重
+        attn = torch.softmax(attn.view(*attn.shape[:-2], -1), dim=-1).view(attn.shape)
+
+        # 应用注意力到值上
+        h_out = torch.einsum("bchinj,bcnjhd->bcihd", attn, v)
+
+        # 合并多头并投影输出
+        h_out = h_out.reshape(batch_size, chunks * self.chunk_len, -1)
+        h_out = self.out_proj(h_out)
+
+        # 恢复原始序列长度
+        h_out = torch.nn.functional.pad(h_out, (0, 0, self.chunk_len - 1, 0))
+        h_out = h_out[:, :residual.size(1)]
+
+        return h_out + residual
+
+
 class FeedForward(nn.Module):
-    def __init__(self,d_model,d_ff):
+    """优化的前馈网络实现"""
+
+    def __init__(self, d_model: int, d_ff: int, eps: float = 1e-5):
         super().__init__()
+        # 两层线性变换
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
 
-        self.lin1=nn.Linear(d_model,d_ff)
-        self.lin2=nn.Linear(d_ff,d_model)
+        # 激活函数(GELU比ReLU表现更好)
+        self.activation = nn.GELU()
 
-        self.act=nn.ReLU()
-        self.norm=nn.LayerNorm(d_model)
+        # 归一化层
+        self.norm = nn.LayerNorm(d_model, eps=eps)
 
-    def forward(self,x):
-        x_ret=x
-        x=self.norm(x)
-        return self.lin2(self.act(self.lin1(x)))+x_ret
+        # 初始化权重
+        self._init_weights()
 
-# 最近邻位置编码
+    def _init_weights(self):
+        # 第一层使用Kaiming初始化配合GELU
+        nn.init.kaiming_normal_(self.linear1.weight, nonlinearity='gelu')
+        if self.linear1.bias is not None:
+            nn.init.zeros_(self.linear1.bias)
+
+        # 第二层使用Xavier初始化
+        nn.init.xavier_uniform_(self.linear2.weight)
+        if self.linear2.bias is not None:
+            nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # 残差连接
+        residual = h
+        h = self.norm(h)
+
+        h = self.linear1(h)
+        h = self.activation(h)
+        h = self.linear2(h)
+
+        return h + residual
+
+
 class NearestNeighborEncoder(nn.Module):
-    def __init__(self,chunk_len,n_layers,ca_layers,d_model,n_heads,d_k,d_ff):
+    """优化的最近邻编码器实现"""
+
+    def __init__(self, chunk_len: int, n_layers: int, ca_layers: Set[int],
+                 d_model: int, n_heads: int, d_k: int, d_ff: int, eps: float = 1e-5):
         super().__init__()
-        self.ca_calayer=ca_layers
-        self.chunk_len=chunk_len
-        self.ca=nn.ModuleList([
-            CrossAttention(d_model,n_heads,d_k) for _ in range(len(ca_layers))
+        self.chunk_len = chunk_len
+        self.ca_layers = ca_layers
+
+        # 自注意力层
+        self.self_attn_layers = nn.ModuleList([
+            SelfAttention(d_model, n_heads, d_k, is_causal=False, eps=eps)
+            for _ in range(n_layers)
         ])
 
-        self.attn=nn.ModuleList([
-            SelfAttention(d_model,n_heads,d_k,is_causal=False) for _ in range(n_layers)
+        # 交叉注意力层(只在指定层使用)
+        self.cross_attn_layers = nn.ModuleList([
+            CrossAttention(d_model, n_heads, d_k, eps=eps)
+            for _ in range(len(ca_layers))
         ])
 
-        self.ff2=nn.ModuleList([
-            FeedForward(d_model,d_ff) for _ in range(n_layers)
+        # 前馈网络层
+        self.ffn_layers = nn.ModuleList([
+            FeedForward(d_model, d_ff, eps=eps)
+            for _ in range(n_layers)
         ])
 
-        self.norm_h=nn.LayerNorm(d_model)
+        # 输入归一化层
+        self.input_norm = nn.LayerNorm(d_model, eps=eps)
 
-    def forward(self,e,h):
-        batch_size,chunks,neighbors,neighbor_len,d_model=e.shape
+    def forward(self, e: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        batch_size, chunks, neighbors, neighbor_len, d_model = e.shape
 
-        h_split=h[:,:self.chunk_len*chunks,:].reshape(batch_size,chunks,chunks,self.chunk_len,d_model)
+        # 分割输入序列为块
+        h_split = h[:, :chunks * self.chunk_len].view(batch_size, chunks, self.chunk_len, d_model)
+        h_split = self.input_norm(h_split)
 
-        h_split=self.norm_h(h_split)
+        cross_attn_idx = 0
 
-        p_ca=0
+        for layer_idx in range(len(self.self_attn_layers)):
+            # 自注意力
+            e = self.self_attn_layers[layer_idx](
+                e.view(-1, neighbor_len, d_model)
+            ).view(batch_size, chunks, neighbors, neighbor_len, d_model)
 
-        for p in range(len(self.attn)):
-            e=self.attn[p](e.view(-1,neighbor_len,d_model)).view(e.shape)
-            if p in self.ca_layers:
-                e=self.ca[p_ca](e,h_split)
-                p_ca+=1
-            e=self.ffw[p](e)
+            # 交叉注意力(如果当前层需要)
+            if layer_idx in self.ca_layers:
+                e = self.cross_attn_layers[cross_attn_idx](e, h_split)
+                cross_attn_idx += 1
+
+            # 前馈网络
+            e = self.ffn_layers[layer_idx](e)
+
         return e
 
 
 class RetroModel(nn.Module):
-    def __init__(self,n_vocab,d_model,n_layers,ca_layers,chunk_len,n_heads,d_k,d_ff,encoder):
+    """优化的RETRO模型实现"""
+
+    def __init__(self, n_vocab: int, d_model: int, n_layers: int, ca_layers: Set[int],
+                 chunk_len: int, n_heads: int, d_k: int, d_ff: int,
+                 encoder: NearestNeighborEncoder, eps: float = 1e-5):
         super().__init__()
-        self.ca_layers=ca_layers
-        self.encoder=encoder
+        self.chunk_len = chunk_len
+        self.ca_layers = ca_layers
+        self.encoder = encoder
 
-        self.emb=nn.Embedding(n_vocab,d_model)
-        self.caa=nn.ModuleList([
-            ChunkedCrossAttention(d_model,n_heads,d_k,chunk_len) for _ in range(len(ca_layers))
+        # 词嵌入层
+        self.token_emb = nn.Embedding(n_vocab, d_model)
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+
+        # 自注意力层
+        self.self_attn_layers = nn.ModuleList([
+            SelfAttention(d_model, n_heads, d_k, is_causal=True, eps=eps)
+            for _ in range(n_layers)
         ])
 
-        self.attn=nn.ModuleList([
-            SelfAttention(d_model,n_heads,d_k,is_causal=True) for _ in range(n_layers)
+        # 分块交叉注意力层
+        self.chunked_cross_attn_layers = nn.ModuleList([
+            ChunkedCrossAttention(d_model, n_heads, d_k, chunk_len, eps=eps)
+            for _ in range(len(ca_layers))
         ])
 
-        self.ffw=nn.ModuleList([FeedForward(d_model,d_ff) for _ in range(n_layers)])
+        # 前馈网络层
+        self.ffn_layers = nn.ModuleList([
+            FeedForward(d_model, d_ff, eps=eps)
+            for _ in range(n_layers)
+        ])
 
-        self.read=nn.Linear(d_model,n_vocab)
+        # 输出层
+        self.output_layer = nn.Linear(d_model, n_vocab)
+        nn.init.zeros_(self.output_layer.bias)
 
-        self.norm_e=nn.LayerNorm(d_model)
+        # 编码器输出归一化层
+        self.encoder_norm = nn.LayerNorm(d_model, eps=eps)
 
-    def forward(self,x,ret):
-        h=self.emb(x)
+    def forward(self, x: torch.Tensor, ret: torch.Tensor) -> torch.Tensor:
+        # 输入验证
+        if x.dim() != 2:
+            raise ValueError(f"输入x必须是2D张量[batch_size, seq_len], 但得到{x.shape}")
+        if ret.dim() != 4:
+            raise ValueError(f"检索的邻居必须是4D张量[batch_size, chunks, neighbors, neighbor_len], 但得到{ret.shape}")
 
-        ret_emb=self.emb(ret)
-        p_ca=0
+        # 词嵌入
+        h = self.token_emb(x)
+        ret_emb = self.token_emb(ret)
 
-        for p in range(len(self.attn)):
-            h=self.attn[p](h)
-            if self.ca_layers and p==min(self.ca_layers):
-                e=self.encoder(ret_emb,h)
-                e=self.norm_e(e)
+        cross_attn_idx = 0
+        encoder_output = None
 
-            if p in self.ca_layers:
-                h=self.cca[p_ca](h,e)
-                p_ca+=1
-            h=self.read(h)
-        return self.read(h)
+        for layer_idx in range(len(self.self_attn_layers)):
+            # 自注意力
+            h = self.self_attn_layers[layer_idx](h)
+
+            # 在第一个交叉注意力层初始化编码器输出
+            if self.ca_layers and layer_idx == min(self.ca_layers):
+                encoder_output = self.encoder(ret_emb, h)
+                encoder_output = self.encoder_norm(encoder_output)
+
+            # 分块交叉注意力(如果当前层需要)
+            if layer_idx in self.ca_layers:
+                h = self.chunked_cross_attn_layers[cross_attn_idx](h, encoder_output)
+                cross_attn_idx += 1
+
+            # 前馈网络
+            h = self.ffn_layers[layer_idx](h)
+
+        # 输出投影
+        return self.output_layer(h)
 
 
-def _test():
-    chunk_len=4
-    d_model=8
-    d_ff=32
-    n_heads=2
-    d_k=4
+def _test_retro_model():
+    """RETRO模型测试函数"""
+    # 基本配置
+    vocab_size = 10000  # 词汇表大小
+    d_model = 512  # 模型维度
+    n_layers = 6  # 层数
+    ca_layers = {2, 5}  # 使用交叉注意力的层
+    chunk_len = 64  # 块长度
+    n_heads = 8  # 注意力头数
+    d_k = 64  # 每个头的维度
+    d_ff = 2048  # 前馈网络隐藏层维度
+    eps = 1e-6  # LayerNorm的小常数
 
-    device=torch.device('cpu')
-    m=RetroModel(5,d_model,6,{2,5},chunk_len,n_heads,d_k,d_ff,
-                 encoder=NearestNeighborEncoder(chunk_len,2,{1},d_model,n_heads,d_k,d_ff))
+    # 设备选择
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
 
-    m.to(device)
-    x=[1,2,3,4,0,1,2,3,4,3]
-    ret = [
-        [[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]],
-        [[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]],
-        ]
-    res=m(torch.tensor([x]*10).to(device),torch.tensor([ret]*10).to(device))
+    # 创建编码器
+    encoder = NearestNeighborEncoder(
+        chunk_len=chunk_len,
+        n_layers=2,
+        ca_layers={1},
+        d_model=d_model,
+        n_heads=n_heads,
+        d_k=d_k,
+        d_ff=d_ff,
+        eps=eps
+    ).to(device)
 
-    inspect(res)
+    # 创建RETRO模型
+    model = RetroModel(
+        n_vocab=vocab_size,
+        d_model=d_model,
+        n_layers=n_layers,
+        ca_layers=ca_layers,
+        chunk_len=chunk_len,
+        n_heads=n_heads,
+        d_k=d_k,
+        d_ff=d_ff,
+        encoder=encoder,
+        eps=eps
+    ).to(device)
+
+    # 测试不同输入长度
+    for seq_len in [128, 256, 512]:
+        batch_size = 4
+        chunks = seq_len // chunk_len
+
+        # 生成随机输入和检索的邻居
+        x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        ret = torch.randint(0, vocab_size, (batch_size, chunks, 2, chunk_len), device=device)
+
+        print(f"\n测试 seq_len={seq_len}, chunks={chunks}")
+
+        try:
+            # 前向传播
+            output = model(x, ret)
+
+            # 验证输出形状
+            assert output.shape == (batch_size, seq_len, vocab_size), \
+                f"输出形状错误: 期望[{batch_size}, {seq_len}, {vocab_size}], 实际{output.shape}"
+
+            # 验证输出值
+            assert not torch.isnan(output).any(), "输出包含NaN值"
+            assert not torch.isinf(output).any(), "输出包含Inf值"
+
+            print(f"测试通过! 输出形状: {output.shape}")
+
+        except Exception as e:
+            print(f"测试失败: {str(e)}")
+
 
 if __name__ == '__main__':
-    _test()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    _test_retro_model()
