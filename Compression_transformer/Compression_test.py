@@ -1,197 +1,266 @@
-from typing import List,Tuple,NamedTuple
+"""
+---
+title: 压缩Transformer实验
+summary: 这个实验在tiny Shakespeare数据集上训练压缩Transformer模型
+---
 
-import  torch
+# 压缩Transformer实验
+
+这是一个带注释的PyTorch实验，用于训练压缩Transformer模型。
+"""
+from typing import List, Tuple, NamedTuple
+
+import torch
 import torch.nn as nn
 
-from labml import monit,experiment,tracker,logger
+from labml import experiment, tracker, monit, logger
 from labml.configs import option
 from labml.logger import Text
 from labml_helpers.metrics.simple_state import SimpleStateModule
 from labml_helpers.module import Module
-from labml_helpers.train_valid import BatchIndex,hook_model_outputs
+from labml_helpers.train_valid import BatchIndex, hook_model_outputs
 from labml_nn.experiments.nlp_autoregression import NLPAutoRegressionConfigs
 from labml_nn.transformers.compressive import CompressiveTransformer, AttentionReconstructionLoss, \
     CompressiveTransformerLayer, Conv1dCompression
-from snappy import uncompress
-from statsmodels.sandbox.distributions.examples.matchdist import targetdist
 
 
-# 封装模型的记忆状态
 class CompressedMemory(NamedTuple):
-    mem:List[torch.Tensor]   # 主记忆（存储历史序列的压缩表示）
-    c_mem:List[torch.TEnsor]  # 压缩记忆（进一步压缩的长期记忆）
+    """
+    ## 压缩记忆容器
+    🧠 使用命名元组存储两种记忆：
+    - mem: 主记忆（短期记忆）
+    - c_mem: 压缩记忆（长期记忆）
+    """
+    mem: List[torch.Tensor]
+    c_mem: List[torch.Tensor]
 
 
 class AutoregressiveModel(Module):
-    def __init__(self,n_vocab:int,d_model:int,transform:CompressiveTransformer):
+    """
+    ## 自回归模型
+    🧠 核心模型结构，包含嵌入层、Transformer和解码器
+    """
+
+    def __init__(self, n_vocab: int, d_model: int, transformer: CompressiveTransformer):
         super().__init__()
-        self.src_embd=nn.Embedding(n_vocab,d_model)  # 词嵌入层,把单词变成数字密码
-        self.transform=transform   # 压缩transform模块 ，处理信息的核心大脑
-        self.generator=nn.Linear(d_model,n_vocab)  # 输出层，输出词的生成概率，把大脑中的输出变成答案
+        # 词嵌入层
+        self.src_embed = nn.Embedding(n_vocab, d_model)
+        # 压缩Transformer模块
+        self.transformer = transformer
+        # 输出生成层
+        self.generator = nn.Linear(d_model, n_vocab)
+        # 注意力掩码缓存
+        self.mask_x = None  # 序列自身的掩码
+        self.mask_mem = None  # 记忆部分的掩码
 
-        self.mask_x=None  # 序列自身的注意力掩码（防止未来信息泄露）下三角矩阵
-        self.mask_mem=None  # 记忆部分的注意力掩码  全1矩阵
-
-    def forward(self,x:torch.Tensor,mem:CompressedMemory):
-        if mem is not None:  # 检查是否有记忆
-            mem,c_mem=mem.mem,mem.c_mem  # 打开记忆盒子
+    def forward(self, x: torch.Tensor, mem: CompressedMemory):
+        """
+        🧠 前向传播流程：
+        1. 处理记忆输入
+        2. 生成注意力掩码
+        3. 词嵌入
+        4. 通过Transformer
+        5. 生成输出
+        """
+        # 获取记忆和压缩记忆
+        if mem is not None:
+            mem, c_mem = mem.mem, mem.c_mem
         else:
-            mem=[]  # 初始化记忆（比如新学生对这里是没有记忆的）
-            c_mem=[]
+            mem = []
+            c_mem = []
 
-        # mask_x的shape（当前序列长度，当前序列长度）
-        # mask_mem的shape（当前序列长度，记忆长度）
-        m_len=mem[0].shape[1] if mem else 0  # 记录记忆长度
+        # 计算记忆总长度（用于掩码生成）
+        m_len = len(mem[0]) if mem else 0
+        if c_mem:
+            m_len += len(c_mem[0])
 
-        if self.mask_x is None or self.mask_x.shape[0]<len(x): # 如果当前掩码序列不够
+        # 生成序列的因果掩码（防止看到未来信息）
+        if self.mask_x is None or self.mask_x.shape[0] < len(x):
             from labml_nn.transformers.utils import subsequent_mask
-            self.mask_x=subsequent_mask(len(x)).to(x.device)  # 重新生成掩码（当前序列长度，当前序列长度）
+            self.mask_x = subsequent_mask(len(x)).to(x.device)
+        # 生成记忆部分的掩码（全1表示完全可见）
+        if self.mask_mem is None or self.mask_mem.shape[1] < m_len or self.mask_mem.shape[0] < len(x):
+            self.mask_mem = self.mask_x.new_ones(len(x), m_len, 1)
 
-        if self.mask_mem is None or self.mask_mem.shape[1]<m_len or self.mask_mem.shape[0]<len(x): # 如果记忆掩码长度不够
-            self.mask_mem=self.mask_x.new_ones(len(x),m_len,1)  # 重新生成全1矩阵
-
+        # 合并记忆掩码和序列掩码
         if m_len:
-            # 拼接掩码矩阵，保证能看到记忆中的单词和当前的单词
-            mask=torch.cat((self.mask_mem[:len(x),:m_len],self.mask_x[:len(x),:len(x)]),dim=1)
+            mask = torch.cat((self.mask_mem[:len(x), :m_len], self.mask_x[:len(x), :len(x)]), dim=1)
         else:
-            # 没有记忆时间直接使当前自身的掩码（当前序列长度，当前序列长度）
-            mask=self.mask_x[:len(x),:len(x)]
-        # 将单词变成数字序列
-        x=self.src_embd(x)
-        # 开始思考
-        res,mem=self.transform(x,mem,c_mem,mask)
-        # 输出答案
-        res=self.generator(res)
+            mask = self.mask_x[:len(x), :len(x)]
 
-        return res,CompressedMemory(mem, c_mem)
+        # 词嵌入
+        x = self.src_embed(x)
+        # 通过Transformer
+        res, mem = self.transformer(x, mem, c_mem, mask)
+        # 生成下一个token的logits
+        res = self.generator(res)
 
-# 配置模块
+        return res, mem
+
+
 class Configs(NLPAutoRegressionConfigs):
-    model:AutoregressiveModel # 自回归模型
-    d_model:int=128  # 隐藏层数量
-    heads:int=4  # Transformer中的多头数
-    dropout:float=0.0  # dropout概率
-    d_ff:int=256  #  FeedForward中的中间层数量
-    n_layers:int=6  # Transformer层数
-    mem_len:int=8  # 主记忆最大长度
-    memory=SimpleStateModule()  # 记忆状态管理模块
-    attention_reconstruction_loss:AttentionReconstructionLoss  # 注意力重建损失
-    compression_rate:int=4  # 记忆压缩概率（每隔多少步压缩一次）
-    c_mem_len:int=128  # 压缩记忆的最大长度
+    """
+    ## 实验配置
+    🧠 包含模型超参数和训练设置
+    """
+
+    model: AutoregressiveModel
+
+    # 模型维度
+    d_model: int = 128
+    # 注意力头数
+    heads: int = 4
+    # Dropout概率
+    dropout: float = 0.0
+    # 前馈层中间维度
+    d_ff: int = 256
+    # Transformer层数
+    n_layers: int = 6
+    # 记忆长度
+    mem_len: int = 8
+    # 记忆状态管理模块
+    memory = SimpleStateModule()
+    # 注意力重建损失
+    attention_reconstruction_loss: AttentionReconstructionLoss
+    # 压缩率（每隔多少步压缩一次）
+    compression_rate: int = 4
+    # 压缩记忆长度
+    c_mem_len: int = 128
 
     def init(self):
-        tracker.set_scalar('ar_loss.*',True)  # 跟踪回归损失
-        tracker.set_scalar('loss.*',True) # 跟踪总损失
-        tracker.set_scalar('ar_loss.*',False) # 不打印日志输出
+        """
+        🧠 初始化跟踪器和状态模块
+        """
+        # 配置跟踪指标
+        tracker.set_scalar("accuracy.*", True)
+        tracker.set_scalar("loss.*", True)
+        # 不在终端显示注意力重建损失
+        tracker.set_scalar("ar_loss.*", False)
+        # 添加钩子记录模型输出
+        hook_model_outputs(self.mode, self.model, 'model')
+        # 保持训练和验证的准确率和记忆状态分离
+        self.state_modules = [self.accuracy, self.memory]
 
-        hook_model_outputs(self.model,self.model,'model')  # 钩子函数监控模型输出
-        self.state_modules=[self.accuracy,self.memory]  # 状态管理模块
-    # 合并新记忆和老记忆
     @torch.no_grad()
-    def merge_compress_memory(self,
-                              mem:CompressedMemory,new_mem:List[torch.Tensor])->Tuple[CompressedMemory,List[torch.Tensor]]:
-        if self.mem_len==0 and self.c_mem_len==0:
-            # 如果mem_len和c_mem_len都是0表示不启用记忆，返回空
-            return CompressedMemory([],[]),[]
+    def merge_compress_memory(self, mem: CompressedMemory, new_mem: List[torch.Tensor]) \
+            -> Tuple[CompressedMemory, List[torch.Tensor]]:
+        """
+        ## 合并和压缩记忆
+        🧠 核心记忆管理逻辑：
+        1. 合并新记忆
+        2. 检查是否超限
+        3. 压缩旧记忆
+        4. 维护压缩记忆队列
+        """
 
-        # 初始化记忆
-        if mem:
-            mem,c_mem=mem.mem,mem.c_mem
+        # 如果配置为不使用记忆
+        if self.mem_len == 0 and self.c_mem_len == 0:
+            return CompressedMemory([], []), []
+
+        # 解构记忆
+        if mem is not None:
+            mem, c_mem = mem.mem, mem.c_mem
         else:
-            mem=[]
-            c_mem=[]
+            mem, c_mem = [], []
 
-        # 合并新记忆
+        # 合并新记忆到主记忆
         if mem:
-            # 如果有以前的记忆，讲新的记忆拼接在老记忆的后面
-            mem=[torch.cat((m,x),dim=0) for m,x in zip(mem,new_mem)]
+            mem = [torch.cat((m, x), dim=0) for m, x in zip(mem, new_mem)]
         else:
-            mem=new_mem
+            mem = new_mem
 
-        # 如果记忆的长度大于了主记忆的最大长度
-        if len(mem[0])>self.mem_len:
-            # 计算需要压缩的记忆块的数量
-            n_c_mem=(len(mem[0])-self.mem_len+self.compression_rate-1)//self.compression_rate
-            # 计算需要压缩的记忆长度（compression=4，表示没四步压缩一次）
-            n_old=n_c_mem*self.compression_rate
+        # 如果主记忆超过限制长度
+        if len(mem[0]) > self.mem_len:
+            # 计算需要压缩的记忆块数
+            n_c_mem = (len(mem[0]) - self.mem_len + self.compression_rate - 1) // self.compression_rate
+            # 计算实际要压缩的记忆长度
+            n_old = n_c_mem * self.compression_rate
+
+            # 待压缩的记忆
+            mem_to_compress = []
+            # 不压缩的记忆
+            uncompressed_mem = []
 
             # 分割记忆
-            mem_to_compress=[]  #带压缩的记忆
-            uncompress_mem=[] # 不压缩的记忆
-
             for m in mem:
-                cm,m=torch.split(m,[n_old,len(m)-n_old])
+                cm, m = torch.split(m, [n_old, len(m) - n_old])
                 mem_to_compress.append(cm)
-                uncompress_mem.append(m)
-            mem=uncompress_mem # 更新主记忆
+                uncompressed_mem.append(m)
+            mem = uncompressed_mem
 
             # 压缩记忆
-            new_c_mem=[]
+            new_c_mem = []
+            for i, layer in enumerate(self.model.transformer.layers):
+                new_c_mem.append(layer.compress(mem_to_compress[i]))
 
-            for i,layer in enumerate(self.model.transform.layers):
-                new_c_mem.append(layer.compress(mem_to_compress[i]))  # 调用压缩函数
-
+            # 合并新旧压缩记忆
             if c_mem:
-                c_mem=[torch.cat((m,nm),dim=0) for m ,nm in zip(c_mem,new_c_mem)]
+                c_mem = [torch.cat((m, nm), dim=0) for m, nm in zip(c_mem, new_c_mem)]
             else:
-                c_mem=new_c_mem
+                c_mem = new_c_mem
 
-            if len(c_mem[0])>self.c_mem_len:
-                c_mem=[m[-self.c_mem_len:] for m in c_mem]
+            # 压缩记忆长度限制
+            if len(c_mem[0]) > self.c_mem_len:
+                c_mem = [m[-self.c_mem_len:] for m in c_mem]
         else:
-            mem_to_compress=[]
+            mem_to_compress = []
 
-        return CompressedMemory(mem, c_mem),mem_to_compress
+        return CompressedMemory(mem, c_mem), mem_to_compress
 
     def step(self, batch: any, batch_idx: BatchIndex):
         """
-        负责单批次训练/验证的核心逻辑
-        :param batch: 但钱批次数据（输入序列，目标序列）
-        :param batch_idx: 批次索引对象（is_train：是否是训练模式，is_last：是否是但钱epoch的最后一批）
-        :return:
+        ## 训练/验证步骤
+        🧠 单批次处理流程：
+        1. 数据准备
+        2. 记忆处理
+        3. 损失计算
+        4. 反向传播（训练模式）
         """
-        # 讲数据移动到GPU或者CPU中
-        data,target=batch[0].to(self.device),batch[1].to(self.device)
-        # 训练模式下的全局步数更新
+
+        # 数据移动到设备
+        data, target = batch[0].to(self.device), batch[1].to(self.device)
+
+        # 训练模式下更新全局步数
         if self.mode.is_train:
-            # 统计已处理的token总数，batch_size*seq_len
-            tracker.add_global_step(data.shape[0]*data.shape[1])
+            tracker.add_global_step(data.shape[0] * data.shape[1])
+
         # 模型前向传播
-        with  self.mode.update(is_log_activations=batch_idx.is_last):
-            # 获取当前记忆
-            mem=self.memory.get()
-            # 讲记忆传入模型中推理返回新的记忆
-            output,new_men=self.model(data,mem)
+        with self.mode.update(is_log_activations=batch_idx.is_last):
+            # 获取记忆
+            mem = self.memory.get()
+            # 模型推理
+            output, new_mem = self.model(data, mem)
             # 合并压缩记忆
-            mem,mem_to_compress=self.merge_compress_memory(mem,new_men)
-            # 更新记忆状态
+            mem, mem_to_compress = self.merge_compress_memory(mem, new_mem)
+            # 更新记忆
             self.memory.set(mem)
-        # 交叉熵计算损失
-        loss=self.loss_func(output,target)
-        tracker.add('loss.',loss)
-        # 如果记忆被压缩
+
+        # 计算交叉熵损失
+        loss = self.loss_func(output, target)
+        tracker.add("loss.", loss)
+
+        # 如果有记忆被压缩，计算重建损失
         if mem_to_compress:
-            ar_loss=self.attention_reconstruction_loss(new_men,mem_to_compress)
+            ar_loss = self.attention_reconstruction_loss(new_mem, mem_to_compress)
+            tracker.add("ar_loss.", ar_loss)
+            loss = loss + ar_loss  # 总损失
 
-            tracker.add('ar_loss.',ar_loss)
+        # 计算准确率
+        self.accuracy(output, target)
+        self.accuracy.track()
 
-            loss+=ar_loss  # 总损失=主损失+记忆重建损失
-
-        self.accuracy(output, target)  # 计算当前批次的准确率
-        self.accuracy.track() # 记录到track
-        # 返现的给传播
+        # 训练模式下的反向传播
         if self.mode.is_train:
-            loss.backward()    # 反向传播
+            loss.backward()
             # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_norm_clip)
-            self.optimizer.step() # 参数更新
-            if batch_idx.is_last:  # 如果是最后一批
-                tracker.add('model',self.model)  # 记录模型状态
+            self.optimizer.step()
+            # 每个epoch最后记录模型状态
+            if batch_idx.is_last:
+                tracker.add('model', self.model)
+            self.optimizer.zero_grad()  # 清空梯度
 
-            # 梯度清零
-            self.optimizer.zero_grad()
-        # 保存结果将跟踪数据写入日志
-        tracker.save()
+        tracker.save()  # 保存指标
 
     def sample(self):
         """
@@ -225,6 +294,7 @@ class Configs(NLPAutoRegressionConfigs):
 
         logger.log(log)  # 打印生成结果
 
+
 @option(Configs.model)
 def autoregressive_model(c: Configs):
     """
@@ -241,6 +311,7 @@ def autoregressive_model(c: Configs):
                                     compress=Conv1dCompression(c.compression_rate, c.d_model)), c.n_layers))
     return m.to(c.device)
 
+
 @option(Configs.attention_reconstruction_loss)
 def attention_reconstruction_loss(c: Configs):
     """
@@ -248,6 +319,7 @@ def attention_reconstruction_loss(c: Configs):
     🧠 确保压缩后的记忆能保留原始信息
     """
     return AttentionReconstructionLoss(c.model.transformer.layers)
+
 
 def main():
     """
@@ -288,27 +360,6 @@ def main():
     with experiment.start():
         conf.run()
 
+
 if __name__ == '__main__':
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
