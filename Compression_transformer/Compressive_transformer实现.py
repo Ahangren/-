@@ -9,8 +9,7 @@ from labml_nn.transformers.feed_forward import FeedForward
 from labml_nn.transformers.mha import PrepareForMultiHeadAttention
 from labml_nn.transformers.xl.relative_mha import RelativeMultiHeadAttention
 from labml_nn.utils import clone_module_list
-
-from transorflow_preject.leNet_5 import batch_size
+from torch import optim
 
 
 class Conv1dCompression(Module):
@@ -227,9 +226,6 @@ class AttentionReconstructionLoss:
     def __call__(self, h:List[torch.Tensor],mem:List[torch.Tensor]):
         losses=[self.calc_loss(layer,h[n],mem[n]) for n,layer in enumerate(self.layers)]
         return sum(losses)
-
-
-
 
 
 
