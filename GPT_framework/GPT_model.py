@@ -1,173 +1,243 @@
 import torch
-from torch import nn
-
-from labml import experiment
-from labml.configs import option
-from labml_helpers.module import Module
-from labml_nn.experiments.nlp_autoregression import NLPAutoRegressionConfigs
-from labml_nn.optimizers.configs import OptimizerConfigs
-from labml_nn.transformers import TransformerConfigs,Encoder
-from labml_nn.transformers.utils import subsequent_mask
+import torch.nn as nn
+import math
+from torch.nn import functional as F
 
 
-class GPT(Module):
+class PositionalEncoding(nn.Module):
     """
-    GPT模型
-    这个模型由三部分组成：1.词嵌入层，（包含位置编码）。2.Transformer编码器，3.输出词概率的线性层
-    这是GPT模型的核心架构，采用Transformer的Decoder-only结构
-    通过自回归方式生成文本，每次只能看到位置之前的token
+    位置编码模块
+    通过正弦和余弦函数为输入嵌入添加位置信息
     """
-    def __init__(self,encoder:Encoder,src_embed:Module,generator:Module):
-        """
-        初始化参数
-        :param encoder: Transformer编码器模块
-        :param src_embed: 包含位置编码的词嵌入模块
-        :param generator: 最后的全连接层，用于输出词概率
-        """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
-        self.src_embed=src_embed  # 词嵌入+位置编码
-        self.encoder=encoder  # Transformer编码器
-        self.generator=generator  # 输出层
-        # 掩码会在第一次前向传播时初始化
-        self.make=None
+        self.dropout = nn.Dropout(p=dropout)  # 随机失活层
 
-    def forward(self,x:torch.Tensor):
-        # 如果掩码未初始化或大小不匹配，创建新的后续掩码
-        # 这种延迟初始化可以适用不同的长度输入
-        if self.mask is None or self.mask.size(0) !=len(x):
-            # 后续掩码，防止看到未来信息
-            self.mask=subsequent_mask(len(x)).to(x.device)
-        # 获取带有位置编码的词嵌入
-        x=self.src_embed(x)
-        # Transformer编码器处理
-        x=self.encoder(x,self.mask)
-        # 获得输出概率
-        x=self.generator(x)
-        return x,None
+        # 计算位置编码
+        position = torch.arange(max_len).unsqueeze(1)  # 位置序列 [max_len, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))  # 除数项
+        pe = torch.zeros(max_len, 1, d_model)  # 初始化位置编码矩阵
+        pe[:, 0, 0::2] = torch.sin(position * div_term)  # 偶数位置使用正弦函数
+        pe[:, 0, 1::2] = torch.cos(position * div_term)  # 奇数位置使用余弦函数
+        self.register_buffer('pe', pe)  # 注册为缓冲区，不参与梯度更新
 
-class Configs(NLPAutoRegressionConfigs):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        参数:
+            x: 输入张量，形状 [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[:x.size(0)]  # 添加位置编码
+        return self.dropout(x)  # 应用dropout
+
+
+class TransformerBlock(nn.Module):
     """
-    配置类
-    继承自NLPAutoRegressionConfigs，用于管理GPT模型的所有配置参数
-    这种配置类，设计使得超参数管理更加结构化，便于实验管理
+    单个Transformer块
+    包含掩码多头注意力和前馈网络
     """
-    # GPT模型示例
-    model:GPT
-    # Transformer配置
-    transformers:TransformerConfigs
-    # 权重衰减系数
-    weight_decay:float=0.1
-    # 预热步数（用于学习率调度）
-    warmup_steps:float=0.1
 
-    # 使用自定义优化器
-    optimizer = 'transformer_optimizer'
+    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        # 层归一化
+        self.ln1 = nn.LayerNorm(d_model)  # 第一个层归一化（注意力前）
+        self.ln2 = nn.LayerNorm(d_model)  # 第二个层归一化（前馈网络前）
 
-@option(Configs.transformer,'GPT')
-def _transformer_configs(c:Configs):
+        # 多头注意力机制
+        self.attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
+
+        # 前馈网络（包含GELU激活）
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),  # 扩展维度
+            nn.GELU(),  # GELU激活函数
+            nn.Linear(d_ff, d_model),  # 降回原维度
+            nn.Dropout(dropout)  # 随机失活
+        )
+        self.dropout = nn.Dropout(dropout)  # 残差连接的dropout
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # 自注意力部分（带残差连接和层归一化）
+        attn_output, _ = self.attn(x, x, x, attn_mask=mask)  # 自注意力计算
+        x = x + self.dropout(attn_output)  # 残差连接
+        x = self.ln1(x)  # 层归一化
+
+        # 前馈网络部分（带残差连接和层归一化）
+        ffn_output = self.ffn(x)  # 前馈网络计算
+        x = x + self.dropout(ffn_output)  # 残差连接
+        x = self.ln2(x)  # 层归一化
+
+        return x
+
+
+class Encoder(nn.Module):
     """
-    这里配置了GPU特有的Transformer参数，
-    特别是使用了GELU激活函数，这是GPU的标注性选择
+    Transformer编码器
+    由多个Transformer块堆叠而成
     """
-    # 使用可配置的Transformer实现
-    conf=TransformerConfigs()
-    # 设置词表大小（嵌入层和输出层）
-    conf.n_src_vocab=c.n_tokens
-    conf.n_tgt_vocab=c.n_tokens
-    # GPT使用GELU作为前馈网络的激活函数
-    conf.ffn.activation='GELU'
 
-    return conf
+    def __init__(self, n_layers: int, d_model: int, n_head: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        # 创建多个Transformer块
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_head, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        # 逐层处理输入
+        for layer in self.layers:
+            x = layer(x, mask)
+        return x
 
 
-def _init_weights(module):
+class GPT(nn.Module):
     """
-    权重初始化
-    线性层和嵌入层的权重初始化为N(0，0.02)的正太分布，而不是默认的Xavier初始化
-    这种初始化方式是GPT模型的另外一个特点，较小的标准差有助于训练稳定性
+    GPT模型（解码器-only架构）
+    包含：
+    1. 词嵌入 + 位置编码
+    2. Transformer编码器堆叠
+    3. 输出线性层
     """
-    if not isinstance(module,(nn.Linear,nn.Embedding)):
-        return
 
-    module.weight.data.normal_(mean=0.0,std=0.02)
+    def __init__(self, n_tokens: int, d_model: int, n_layers: int, n_head: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        # 词嵌入层
+        self.token_embed = nn.Embedding(n_tokens, d_model)
+        # 位置编码层
+        self.pos_embed = PositionalEncoding(d_model, dropout)
+        # Transformer编码器
+        self.encoder = Encoder(n_layers, d_model, n_head, d_ff, dropout)
+        # 输出线性层（词表大小）
+        self.generator = nn.Linear(d_model, n_tokens)
 
-    # 如果由偏置项，初始化为0
-    if isinstance(module,nn.Linear) and module.bias is not None:
-        module.bias.data.zero_()
+        # 初始化权重
+        self.apply(self._init_weights)
 
-@option(Configs.model)
-def _model(c:Configs):
+        # 掩码将在前向传播时创建
+        self.mask = None
+
+    def _init_weights(self, module):
+        """权重初始化（GPT风格）"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # 线性层和嵌入层权重初始化为N(0, 0.02)
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            # 如果有偏置项，初始化为0
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 创建后续掩码（如果不存在或尺寸不匹配）
+        if self.mask is None or self.mask.size(0) != x.size(1):
+            self.mask = self.generate_square_subsequent_mask(x.size(1)).to(x.device)
+
+        # 获取词嵌入并添加位置编码
+        x = self.token_embed(x)  # [batch_size, seq_len, d_model]
+        x = x.transpose(0, 1)  # [seq_len, batch_size, d_model]（Transformer要求的输入格式）
+        x = self.pos_embed(x)  # 添加位置编码
+
+        # 通过Transformer编码器
+        x = self.encoder(x, self.mask)
+
+        # 生成输出概率
+        x = x.transpose(0, 1)  # 恢复为[batch_size, seq_len, d_model]
+        x = self.generator(x)  # 线性投影到词表空间
+
+        return x
+
+    @staticmethod
+    def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
+        """生成上三角掩码（防止看到未来信息）"""
+        return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
+
+
+class AdamWarmupCosineDecay(torch.optim.AdamW):
     """
-    创建GPU模型并且初始化权重
-    这是工厂函数模式，通过配置动态创建模型示例
+    带预热和余弦衰减的AdamW优化器
+    GPT训练常用配置：
+    - 初始学习率6e-4
+    - 权重衰减0.1（仅应用于特定参数）
+    - 预热步骤2000
     """
-    m=GPT(c.transformers.encoder,
-          c.transformers.src_embed,
-          c.transformers.generator).to(c.device)
 
-    # 应用自定义权重初始化
-    m.apply(_init_weights)
+    def __init__(self, params, lr=6e-4, betas=(0.9, 0.95), eps=1e-8,
+                 weight_decay=0.01, warmup=0.1, total_steps=10000):
+        super().__init__(params, lr=0.0, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.warmup = warmup  # 预热步数比例
+        self.total_steps = total_steps  # 总训练步数
+        self.base_lr = lr  # 基础学习率
+        self.current_step = 0  # 当前步数
 
-    return m
+    def get_lr(self):
+        """计算当前学习率"""
+        if self.current_step < self.warmup:
+            # 线性预热阶段
+            return self.base_lr * (self.current_step / self.warmup)
+        # 余弦衰减阶段
+        progress = (self.current_step - self.warmup) / (self.total_steps - self.warmup)
+        return self.base_lr * (0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    def step(self, closure=None):
+        """优化器步进"""
+        self.current_step += 1
+        # 更新所有参数组的学习率
+        for group in self.param_groups:
+            group['lr'] = self.get_lr()
+        super().step(closure)
 
 
-@option(NLPAutoRegressionConfigs.optimizer)
-def transformer_optimizer(c:NLPAutoRegressionConfigs):
+def create_optimizer(model: nn.Module, weight_decay: float = 0.1,
+                     lr: float = 6e-4, warmup: int = 2000, total_steps: int = 100000):
     """
-    创建带权重衰减的自定义优化器
-    代码参考自minGPT项目，只对线性层的权重应用权重衰减
-    这种精细化的权重衰减策略可以防止过拟合，同时不影响其他参数（如LayerNorm参数）的学习
+    创建优化器（GPT风格）
+    特点：
+    - 权重衰减仅应用于线性层的权重
+    - 其他参数（如层归一化参数）不应用权重衰减
     """
     # 收集需要应用权重衰减的参数名
-    decay=set()
-    for mn,m in c.model.named_modules():  # 遍历c中的所有模块
-        for pn,p in m.named_parameters():  # 遍历模块的所有参数
-            fpn=f'{mn}.{pn}' if mn else pn  # 完整参数名（如"transformer.layers.0.linear1.weight"）
+    decay = set()
+    for mn, m in model.named_modules():
+        for pn, p in m.named_parameters():
+            fpn = f'{mn}.{pn}' if mn else pn  # 完整参数名
             # 如果是线性层的weight参数，加入衰减集合
-            if fpn.endswith('weight') and isinstance(m,nn.Linear):
+            if fpn.endswith('weight') and isinstance(m, nn.Linear):
                 decay.add(fpn)
 
-    # 获取所有参数
-    param_dict={pn:p for pn ,p in c.model.named_parameters()}
-    # 不需要衰减的参数=所有的参数-需要衰减的参数
-    no_decay=set(param_dict.keys())-decay
-    # 创建两个参数组
-    opt_groups=[
-        {'params':[param_dict[pn] for pn in sorted(list(decay))] ,"weight_decay":c.weight_decay}, # 衰减组
-        {"params":[param_dict[pn] for pn in sorted(list(no_decay))],"weight_decay":0.0} # 不衰减组
+    # 参数分组
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    no_decay = set(param_dict.keys()) - decay  # 不需要衰减的参数
+
+    # 创建参数组
+    opt_groups = [
+        {'params': [param_dict[pn] for pn in sorted(list(decay))], 'weight_decay': weight_decay},
+        {'params': [param_dict[pn] for pn in sorted(list(no_decay))], 'weight_decay': 0.0}
     ]
 
-    # 创建可配置的优化器
-    optimizer=OptimizerConfigs()
-    # 设置参数组
-    optimizer.parameters=opt_groups
-
-    # 使用AdamW优化器+余弦退火学习率调度
-    optimizer.optimizer='AdamWarmupCosineDecay'
-
-    # 设置模型维度（影响学习率计算）
-    optimizer.d_model=c.d_model
-
-    # 基础学习率（GPU使用6e-4）
-    optimizer.learning_rate=6e-4
-
-    # Adam的超参数
-    optimizer.betas=(0.9,0.95)  # (beta1,bate2)
-
-    optimizer.eps=1e-8  # 数值稳定项
-
-    # 解耦权重衰减（AdamW的关键改进）
-    optimizer.weight_decouple=True
-
-    # 学习率调度相关
-    optimizer.total_steps = c.epochs * len(c.text.train) // (c.batch_size * c.seq_len)  # 总训练步数
-    optimizer.warmup = c.warmup_steps // (c.batch_size * c.seq_len)  # 预热步数
+    # 返回配置好的优化器
+    return AdamWarmupCosineDecay(opt_groups, lr=lr, warmup=warmup, total_steps=total_steps)
 
 
+# 示例用法
+if __name__ == "__main__":
+    # 超参数配置（GPT-small规模）
+    n_tokens = 10000  # 词表大小
+    d_model = 768  # 嵌入维度
+    n_layers = 12  # Transformer层数
+    n_head = 12  # 注意力头数
+    d_ff = 3072  # 前馈网络隐藏层维度
+    dropout = 0.1  # dropout率
 
+    # 创建模型实例
+    model = GPT(n_tokens, d_model, n_layers, n_head, d_ff, dropout)
 
+    # 创建优化器（GPT训练配置）
+    optimizer = create_optimizer(model)
 
+    # 模拟输入数据（batch_size=4, seq_len=32）
+    batch_size = 4
+    seq_len = 32
+    x = torch.randint(0, n_tokens, (batch_size, seq_len))
 
-
-
-
+    # 前向传播
+    output = model(x)
+    print(f"输出形状: {output.shape}")  # 应为 [batch_size, seq_len, n_tokens]
