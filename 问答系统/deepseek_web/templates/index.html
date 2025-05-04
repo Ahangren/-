@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI对话助手</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <style>
+        :root {
+            --primary-color: #10a37f;
+            --bg-color: #f0f2f5;
+        }
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        #chat-container {
+            height: 70vh;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+            background: white;
+            margin-bottom: 20px;
+        }
+        .message {
+            margin: 12px 0;
+            display: flex;
+            gap: 15px;
+        }
+        .user-message {
+            justify-content: flex-end;
+        }
+        .message-content {
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 8px;
+        }
+        .assistant-message .message-content {
+            background: #f8f9fa;
+            border: 1px solid #e0e0e0;
+        }
+        .user-message .message-content {
+            background: var(--primary-color);
+            color: white;
+        }
+        #input-container {
+            display: flex;
+            gap: 10px;
+        }
+        #user-input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            resize: none;
+            min-height: 44px;
+        }
+        button {
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 0 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .typing-indicator {
+            display: inline-block;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }
+        .dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            margin-right: 3px;
+            background: #ccc;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite;
+        }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: translateY(0); }
+            40% { transform: translateY(-6px); }
+        }
+        .markdown-content {
+            line-height: 1.6;
+            transition: opacity 0.3s;
+        }
+        .markdown-content:not(.markdown-rendered) {
+            opacity: 0.5;
+        }
+        .markdown-content h1 {
+            font-size: 2em;
+            margin: 0.67em 0;
+        }
+        .markdown-content h2 {
+            font-size: 1.5em;
+            margin: 0.83em 0;
+        }
+        .markdown-content pre {
+            background: #f5f5f5;
+            padding: 1em;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container"></div>
+    <div id="input-container">
+        <textarea id="user-input" placeholder="输入消息..." rows="1"></textarea>
+        <button id="send-btn">发送</button>
+    </div>
+
+    <script>
+        // 初始化配置
+        document.addEventListener('DOMContentLoaded', function() {
+            // 配置marked.js和highlight.js
+            marked.setOptions({
+                breaks: true,
+                gfm: true,
+                highlight: function(code, lang) {
+                    if (lang && hljs.getLanguage(lang)) {
+                        return hljs.highlight(lang, code).value;
+                    }
+                    return hljs.highlightAuto(code).value;
+                }
+            });
+
+            // 防止Chrome扩展干扰
+            if (window.chrome && window.chrome.runtime) {
+                console.warn('检测到Chrome扩展，可能会影响页面功能');
+            }
+
+            const chatContainer = document.getElementById('chat-container');
+            const userInput = document.getElementById('user-input');
+            const sendBtn = document.getElementById('send-btn');
+
+            // 滚动到底部
+            function scrollToBottom() {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+
+            // 添加用户消息
+            function addUserMessage(content) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message user-message';
+                messageDiv.innerHTML = `<div class="message-content">${content}</div>`;
+                chatContainer.appendChild(messageDiv);
+                scrollToBottom();
+            }
+
+            // 添加AI消息
+            async function addAssistantMessageStream() {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message assistant-message';
+                messageDiv.innerHTML = `
+                    <div class="message-content markdown-content">
+                        <div class="typing-indicator">
+                            <span class="dot"></span>
+                            <span class="dot" style="animation-delay: 0.2s"></span>
+                            <span class="dot" style="animation-delay: 0.4s"></span>
+                        </div>
+                    </div>`;
+                chatContainer.appendChild(messageDiv);
+                scrollToBottom();
+                return messageDiv.querySelector('.message-content');
+            }
+
+            // 流式消息处理
+            async function createStreamTypewriter(stream, container) {
+                let reader = stream.body.getReader();
+                let decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    container.innerHTML = marked.parse(buffer);
+                    scrollToBottom();
+                }
+
+                // 最终渲染
+                container.innerHTML = marked.parse(buffer);
+                hljs.highlightAll();
+                scrollToBottom();
+            }
+
+            // 发送消息
+            async function sendMessage() {
+                const content = userInput.value.trim();
+                if (!content) return;
+
+                sendBtn.disabled = true;
+                userInput.disabled = true;
+                userInput.value = '';
+
+                addUserMessage(content);
+                const responseContainer = await addAssistantMessageStream();
+
+                try {
+                    const response = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: content })
+                    });
+
+                    if (!response.ok) throw new Error('请求失败');
+                    await createStreamTypewriter(response, responseContainer);
+                } catch (error) {
+                    responseContainer.innerHTML = '❌ 请求出错: ' + error.message;
+                } finally {
+                    sendBtn.disabled = false;
+                    userInput.disabled = false;
+                    userInput.focus();
+                }
+            }
+
+            // 事件监听
+            sendBtn.addEventListener('click', sendMessage);
+            userInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) {
+                    e.preventDefault();
+                    sendMessage();
+                } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    userInput.value += '\n';
+                }
+            });
+        });
+    </script>
+</body>
+</html>
