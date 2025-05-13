@@ -1,6 +1,6 @@
 import chromadb
-from chromadb import Settings
 from langchain_chroma import Chroma
+
 
 class ChromaDB:
     def __init__(self,
