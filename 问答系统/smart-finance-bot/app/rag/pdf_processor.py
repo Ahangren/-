@@ -1,10 +1,12 @@
-import os
 import logging
+import os
 import time
-from tqdm import tqdm
+
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rag.chroma_conn import ChromaDB
+from tqdm import tqdm
+
 
 class PDFProcessor:
     def __init__(self,
