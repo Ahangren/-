@@ -2,5 +2,8 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/embedding技术/ragdata" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/问答系统/smart-finance-bot/chatweb" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/问答系统/smart-finance-bot/dataset/dataset" vcs="Git" />
   </component>
 </project>

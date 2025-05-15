@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  elasticsearch:
+    image: elasticsearch:7.17.10
+    container_name: es
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g  # 显式分配 1GB 内存
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+    ulimits:
+      memlock: -1
+      nofile: 65536
+    ports:
+      - "9201:9200"
+    volumes:
+      - ./data:/usr/share/elasticsearch/data
+    networks:
+      - elastic-net
+
+networks:
+  elastic-net:
+    driver: bridge

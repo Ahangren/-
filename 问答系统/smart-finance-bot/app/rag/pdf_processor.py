@@ -1,136 +1,151 @@
 import logging
 import os
 import time
+from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rag.chroma_conn import ChromaDB
 from tqdm import tqdm
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
+from rag.chroma_conn import ChromaDB
 
 
 class PDFProcessor:
-    def __init__(self,
-                 directory,  # PDF文件所在目录
-                 chroma_server_type,  # ChromaDB服务器类型
-                 persist_path,  # ChromaDB持久化路径
-                 embed):  # 向量化函数
+    def __init__(self, directory: str, chroma_server_type: str, persist_path: str, embed: callable,
+                 file_group_num: int = 20,  # 减少每组处理的文件数
+                 batch_num: int = 4,  # 减少每批插入的文档数
+                 max_workers: int = 4,  # 并发处理线程数
+                 chunk_size: int = 500,
+                 chunk_overlap: int = 100):
 
         self.directory = directory
-        self.file_group_num = 80  # 每组处理的文件数
-        self.batch_num = 6  # 每次插入的批次数量
+        self.file_group_num = file_group_num
+        self.batch_num = batch_num
+        self.max_workers = max_workers
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
 
-        self.chunksize = 500  # 切分文本的大小
-        self.overlap = 100  # 切分文本的重叠大小
-
-        self.chroma_db = ChromaDB(chroma_server_type=chroma_server_type,
-                                  persist_path=persist_path,
-                                  embed=embed)
         # 配置日志
+        self.logger = logging.getLogger(__name__)
+        self._setup_logging()
+
+        # 初始化ChromaDB连接
+        self.chroma_db = ChromaDB(
+            chromadb_server_type=chroma_server_type,
+            persist_path=persist_path,
+            embed=embed
+        )
+
+    def _setup_logging(self):
+        """配置日志记录"""
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler("pdf_processor.log"),  # 同时记录到文件
+                logging.StreamHandler()
+            ]
         )
 
-    def load_pdf_files(self):
-        """
-        加载目录下的所有PDF文件
-        """
-        pdf_files = []
-        for file in os.listdir(self.directory):
-            if file.lower().endswith('.pdf'):
-                pdf_files.append(os.path.join(self.directory, file))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((requests.exceptions.ConnectionError, ConnectionResetError))
+    )
+    def _safe_add_documents(self, batch):
+        """带重试机制的文档插入方法"""
+        try:
+            self.chroma_db.add_with_langchain(batch)
+            return True
+        except Exception as e:
+            self.logger.warning(f"文档插入失败，将重试: {str(e)}")
+            raise
 
-        logging.info(f"Found {len(pdf_files)} PDF files.")
+    def load_pdf_files(self) -> List[str]:
+        """加载目录下的所有PDF文件"""
+        if not os.path.exists(self.directory):
+            raise FileNotFoundError(f"目录不存在: {self.directory}")
+
+        pdf_files = [
+            os.path.join(self.directory, f)
+            for f in os.listdir(self.directory)
+            if f.lower().endswith('.pdf')
+        ]
+        self.logger.info(f"发现 {len(pdf_files)} 个PDF文件")
         return pdf_files
 
-    def load_pdf_content(self, pdf_path):
-        """
-        读取PDF文件内容
-        """
-        pdf_loader = PyMuPDFLoader(file_path=pdf_path)
-        docs = pdf_loader.load()
-        logging.info(f"Loading content from {pdf_path}.")
-        return docs
-
-    def split_text(self, documents):
-        """
-        将文本切分成小段
-        """
-        # 切分文档
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunksize,
-            chunk_overlap=self.overlap,
-            length_function=len,
-            add_start_index=True,
-        )
-
-        docs = text_splitter.split_documents(documents)
-
-        logging.info("Split text into smaller chunks with RecursiveCharacterTextSplitter.")
-        return docs
-
-    def insert_docs_chromadb(self, docs, batch_size=6):
-        """
-        将文档插入到ChromaDB
-        """
-        # 分批入库
-        logging.info(f"Inserting {len(docs)} documents into ChromaDB.")
-
-        # 记录开始时间
-        start_time = time.time()
-        total_docs_inserted = 0
-
-        # 计算总批次
-        total_batches = (len(docs) + batch_size - 1) // batch_size
-
-        with tqdm(total=total_batches, desc="Inserting batches", unit="batch") as pbar:
-            for i in range(0, len(docs), batch_size):
-                # 获取当前批次的样本
-                batch = docs[i:i + batch_size]
-
-                # 将样本入库
-                self.chroma_db.add_with_langchain(batch)
-                # self.chroma_db.async_add_with_langchain(batch)
-
-                # 更新已插入的文档数量
-                total_docs_inserted += len(batch)
-
-                # 计算并显示当前的TPM
-                elapsed_time = time.time() - start_time  # 计算已用时间（秒）
-                if elapsed_time > 0:  # 防止除以零
-                    tpm = (total_docs_inserted / elapsed_time) * 60  # 转换为每分钟插入的文档数
-                    pbar.set_postfix({"TPM": f"{tpm:.2f}"})  # 更新进度条的后缀信息
-
-                # 更新进度条
-                pbar.update(1)
-
-    def process_pdfs_group(self, pdf_files_group):
-        # 读取PDF文件内容
-        pdf_contents = []
-
-        for pdf_path in pdf_files_group:
-            # 读取PDF文件内容
-            documents = self.load_pdf_content(pdf_path)
-
-            # 将documents 逐一添加到pdf_contents
-            pdf_contents.extend(documents)
-
-        # 将文本切分成小段
-        docs = self.split_text(pdf_contents)
-
-        # 将文档插入到ChromaDB
-        self.insert_docs_chromadb(docs, self.batch_num)
+    def load_pdf_content(self, pdf_path: str) -> Optional[List[Document]]:
+        """安全地加载PDF内容"""
+        try:
+            loader = PyMuPDFLoader(pdf_path)
+            return loader.load()
+        except Exception as e:
+            self.logger.error(f"加载PDF失败 {pdf_path}: {str(e)}")
+            return None
 
     def process_pdfs(self):
-        # 获取目录下所有的PDF文件
+        """处理所有PDF文件的主方法"""
         pdf_files = self.load_pdf_files()
+        if not pdf_files:
+            self.logger.warning("没有找到PDF文件")
+            return
 
-        group_num = self.file_group_num
+        # 分批处理PDF文件
+        for i in range(0, len(pdf_files), self.file_group_num):
+            group = pdf_files[i:i + self.file_group_num]
+            self.logger.info(f"正在处理第 {i // self.file_group_num + 1} 组 ({len(group)} 个文件)")
 
-        # group_num 个PDF文件为一组，分批处理
-        for i in range(0, len(pdf_files), group_num):
-            pdf_files_group = pdf_files[i:i + group_num]
-            self.process_pdfs_group(pdf_files_group)
+            try:
+                self._process_group(group)
+            except Exception as e:
+                self.logger.error(f"处理组失败: {str(e)}")
+                # 可以选择继续处理下一组
+                continue
 
-        print("PDFs processed successfully!")
+    def _process_group(self, file_group: List[str]):
+        """处理一组PDF文件"""
+        # 并发加载PDF内容
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self.load_pdf_content, f) for f in file_group]
+            documents = []
+
+            for future in tqdm(as_completed(futures), total=len(futures), desc="加载PDF"):
+                result = future.result()
+                if result:
+                    documents.extend(result)
+
+        if not documents:
+            self.logger.warning("当前组没有有效的PDF内容")
+            return
+
+        # 分割文本
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap
+        )
+        chunks = splitter.split_documents(documents)
+        self.logger.info(f"分割得到 {len(chunks)} 个文本块")
+
+        # 分批插入ChromaDB
+        self._insert_batches(chunks)
+
+    def _insert_batches(self, chunks: List[Document]):
+        """分批插入文档到ChromaDB"""
+        total_batches = (len(chunks) + self.batch_num - 1) // self.batch_num
+        progress = tqdm(total=total_batches, desc="插入文档")
+
+        for i in range(0, len(chunks), self.batch_num):
+            batch = chunks[i:i + self.batch_num]
+
+            try:
+                self._safe_add_documents(batch)
+                progress.update(1)
+            except Exception as e:
+                self.logger.error(f"插入批次 {i // self.batch_num + 1} 失败: {str(e)}")
+                # 可以选择保存失败的批次以便后续重试
+                continue
+
+        progress.close()
